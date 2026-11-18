@@ -1,0 +1,57 @@
+name: Build macOS VST3
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache JUCE download
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: juce-8.0.17-security-${{ runner.os }}
+
+      - name: Configure
+        run: cmake -B build -G Xcode -DCMAKE_BUILD_TYPE=Release 2>&1 | tee configure.log
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cmake --build build --config Release --target TCSpectrumAnalyzer_VST3 -- -quiet 2>&1 | tee build.log
+
+      - name: Sign (ad-hoc) and package
+        run: |
+          VST="build/TCSpectrumAnalyzer_artefacts/Release/VST3/TC Spectrum Analyzer.vst3"
+          codesign --force --deep --sign - "$VST"
+          codesign --verify --verbose "$VST"
+          cd "build/TCSpectrumAnalyzer_artefacts/Release/VST3"
+          ditto -c -k --keepParent "TC Spectrum Analyzer.vst3" "$GITHUB_WORKSPACE/TC-Spectrum-Analyzer-macOS.zip"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest TC-Spectrum-Analyzer-macOS.zip \
+            --title "TC Spectrum Analyzer (latest build)" \
+            --notes "Build ${{ github.run_number }} from ${{ github.sha }}" \
+            --target ${{ github.sha }}
+
+      - name: Publish build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat configure.log build.log > failure.log 2>/dev/null || true
+          grep -E "error|Error" failure.log | head -200 > errors.txt || true
+          gh release delete build-log --yes --cleanup-tag || true
+          gh release create build-log failure.log errors.txt --title "Build log (failed run ${{ github.run_number }})" --notes "Automatic log of the failed build" --target ${{ github.sha }} --prerelease
