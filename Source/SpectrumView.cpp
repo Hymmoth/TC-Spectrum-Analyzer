@@ -205,22 +205,22 @@ void SpectrumView::tick (double dt)
         const float fallSec = TCSpectrumAnalyzerProcessor::fallSecondsFromNormalised (fallParam->load());
         const float fallDb = fallSec > 0.0f ? (float) (20.0 / fallSec * dt) : 0.0f; // 20 dB per "fall" time
         const auto hidden = proc.hiddenChannels.load();
+        analyzer.hiddenMask.store (hidden);
 
-        // ballistics, applied every frame so the motion is smooth whatever the FFT update rate
+        // ballistics, applied every frame so the motion is smooth
         const bool rms = juce::roundToInt (detectParam->load()) == 1;
         const double tau = juce::jmax (0.001, (double) responseParam->load() * 0.001);
         const float peakDecay = (float) std::exp (-2.0 * dt / tau);   // power domain
         const float rmsCoeff  = (float) (1.0 - std::exp (-dt / tau));
-        const float scale = rms ? 1.0f : 2.0f;                         // Peak: a sine reads its peak level
 
-        std::array<float, Analyzer::maxBands> sp {}, smx {};
+        std::array<float, Analyzer::maxBands> sp {};
 
         for (int ch = 0; ch < numCh; ++ch)
         {
             const bool shown = (hidden & ((juce::uint32) 1 << ch)) == 0;
             for (int b = 0; b < numBands; ++b)
             {
-                const float w = weights[(size_t) b] * scale;
+                const float w = weights[(size_t) b];
                 const float p  = analyzer.getBandPower (ch, b) * w;
                 const float mx = analyzer.takeBandMax (ch, b) * w;
                 float& d = disp[(size_t) ch][(size_t) b];
@@ -228,8 +228,8 @@ void SpectrumView::tick (double dt)
                 else     d = juce::jmax (mx, d * peakDecay);
                 curDb[(size_t) ch][(size_t) b] = powToDb (d);
                 float& h = holdDb[(size_t) ch][(size_t) b];
-                h = juce::jmax (h - fallDb, powToDb (mx), -200.0f);
-                if (shown) { sp[(size_t) b] += d; smx[(size_t) b] += mx; }
+                h = juce::jmax (h - fallDb, curDb[(size_t) ch][(size_t) b], -200.0f);   // holds the displayed curve
+                if (shown) sp[(size_t) b] += d;
             }
         }
 
@@ -237,7 +237,7 @@ void SpectrumView::tick (double dt)
         {
             sumDb[(size_t) b] = powToDb (sp[(size_t) b]);
             float& h = sumHoldDb[(size_t) b];
-            h = juce::jmax (h - fallDb, powToDb (smx[(size_t) b]), -200.0f);
+            h = juce::jmax (h - fallDb, sumDb[(size_t) b], -200.0f);
         }
     }
 

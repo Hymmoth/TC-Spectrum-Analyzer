@@ -32,8 +32,8 @@ namespace
     }
 }
 
-TCSpectrumAnalyzerEditor::TCSpectrumAnalyzerEditor (TCSpectrumAnalyzerProcessor& p)
-    : AudioProcessorEditor (&p), proc (p),
+MainPanel::MainPanel (TCSpectrumAnalyzerProcessor& p)
+    : proc (p),
       spectrum (p), meter (p),
       detect (param (p, ParamIDs::detect)),
       lfRes (param (p, ParamIDs::lfRes)),
@@ -60,7 +60,14 @@ TCSpectrumAnalyzerEditor::TCSpectrumAnalyzerEditor (TCSpectrumAnalyzerProcessor&
     coloursButton.onClick = [this] { showColourMenu(); };
     meterButton.setClickingTogglesState (true);
     meterAttachment = std::make_unique<juce::ButtonParameterAttachment> (param (p, ParamIDs::meter), meterButton);
-    meterButton.onStateChange = [this] { if (meter.isVisible() != meterButton.getToggleState()) resized(); };
+    meterButton.onStateChange = [this]
+    {
+        if (meter.isVisible() != meterButton.getToggleState())
+        {
+            if (onBaseSizeChanged) onBaseSizeChanged();
+            resized();
+        }
+    };
 
     // sliders
     for (auto* s : { &response, &fall })
@@ -117,20 +124,17 @@ TCSpectrumAnalyzerEditor::TCSpectrumAnalyzerEditor (TCSpectrumAnalyzerProcessor&
     };
 
     proc.analyzer.spectrumActive.store (true);
-
-    setResizable (true, true);
-    setResizeLimits (560, 400, 2800, 1600);
-    setSize (juce::jlimit (560, 2800, proc.editorWidth.load()), juce::jlimit (400, 1600, proc.editorHeight.load()));
+    setSize (getBaseWidth(), baseHeight);
     lastTick = juce::Time::getMillisecondCounterHiRes();
 }
 
-TCSpectrumAnalyzerEditor::~TCSpectrumAnalyzerEditor()
+MainPanel::~MainPanel()
 {
     proc.analyzer.spectrumActive.store (false);
     setLookAndFeel (nullptr);
 }
 
-void TCSpectrumAnalyzerEditor::tick()
+void MainPanel::tick()
 {
     const double now = juce::Time::getMillisecondCounterHiRes();
     const double dt = juce::jlimit (0.0, 0.25, (now - lastTick) * 0.001);
@@ -157,7 +161,7 @@ void TCSpectrumAnalyzerEditor::tick()
         meter.tick (dt);
 }
 
-void TCSpectrumAnalyzerEditor::showColourMenu()
+void MainPanel::showColourMenu()
 {
     juce::PopupMenu m;
     const auto names = proc.getChannelNames();
@@ -179,7 +183,7 @@ void TCSpectrumAnalyzerEditor::showColourMenu()
         });
 }
 
-int TCSpectrumAnalyzerEditor::bottomRowsNeeded (int width) const
+int MainPanel::bottomRowsNeeded (int width) const
 {
     int rows = 1, x = 0;
     for (auto& g : groups)
@@ -191,7 +195,7 @@ int TCSpectrumAnalyzerEditor::bottomRowsNeeded (int width) const
     return rows;
 }
 
-void TCSpectrumAnalyzerEditor::layoutBottom (juce::Rectangle<int> area)
+void MainPanel::layoutBottom (juce::Rectangle<int> area)
 {
     const int rowH = 52;
     int x = area.getX(), y = area.getY();
@@ -214,10 +218,8 @@ void TCSpectrumAnalyzerEditor::layoutBottom (juce::Rectangle<int> area)
     }
 }
 
-void TCSpectrumAnalyzerEditor::resized()
+void MainPanel::resized()
 {
-    proc.editorWidth.store (getWidth());
-    proc.editorHeight.store (getHeight());
 
     auto r = getLocalBounds();
     topBar = r.removeFromTop (44);
@@ -244,7 +246,7 @@ void TCSpectrumAnalyzerEditor::resized()
     meter.setVisible (showMeter);
     if (showMeter)
     {
-        meter.setBounds (content.removeFromRight (getWidth() < 760 ? 176 : 240));
+        meter.setBounds (content.removeFromRight (220));
         content.removeFromRight (compact ? 8 : 12);
     }
     spectrum.setBounds (content);
@@ -252,7 +254,7 @@ void TCSpectrumAnalyzerEditor::resized()
     layoutBottom (bottom.withTrimmedTop (4));
 }
 
-void TCSpectrumAnalyzerEditor::paint (juce::Graphics& g)
+void MainPanel::paint (juce::Graphics& g)
 {
     g.fillAll (Theme::window);
 
@@ -286,4 +288,40 @@ void TCSpectrumAnalyzerEditor::paint (juce::Graphics& g)
     g.setColour (Theme::textDim);
     for (auto& grp : groups)
         g.drawText (grp.caption, grp.captionArea, juce::Justification::centredLeft);
+}
+
+// ---------------------------------------------------------------------------
+TCSpectrumAnalyzerEditor::TCSpectrumAnalyzerEditor (TCSpectrumAnalyzerProcessor& p)
+    : AudioProcessorEditor (&p), proc (p), panel (p)
+{
+    addAndMakeVisible (panel);
+    panel.onBaseSizeChanged = [this] { applyBaseSize (currentScale); };
+
+    setResizable (true, true);
+    const float savedScale = (float) proc.editorWidth.load() / 1000.0f; // stored as width at 1000 px base
+    applyBaseSize (juce::jlimit (0.56f, 2.6f, savedScale > 0.1f ? savedScale : 1.0f));
+}
+
+TCSpectrumAnalyzerEditor::~TCSpectrumAnalyzerEditor() = default;
+
+void TCSpectrumAnalyzerEditor::applyBaseSize (float scale)
+{
+    const int bw = panel.getBaseWidth(), bh = MainPanel::baseHeight;
+    if (auto* c = getConstrainer())
+    {
+        c->setFixedAspectRatio ((double) bw / (double) bh);
+        c->setSizeLimits (juce::roundToInt (bw * 0.56f), juce::roundToInt (bh * 0.56f),
+                          juce::roundToInt (bw * 2.6f), juce::roundToInt (bh * 2.6f));
+    }
+    setSize (juce::roundToInt (bw * scale), juce::roundToInt (bh * scale));
+}
+
+void TCSpectrumAnalyzerEditor::resized()
+{
+    const int bw = panel.getBaseWidth();
+    currentScale = (float) getWidth() / (float) bw;
+    proc.editorWidth.store (juce::roundToInt (currentScale * 1000.0f));
+    proc.editorHeight.store (getHeight());
+    panel.setTransform (juce::AffineTransform::scale (currentScale));
+    panel.setBounds (0, 0, bw, MainPanel::baseHeight);
 }

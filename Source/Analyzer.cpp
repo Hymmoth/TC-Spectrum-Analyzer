@@ -1,5 +1,6 @@
 #include "Analyzer.h"
 #include <cmath>
+#include <complex>
 
 namespace
 {
@@ -34,7 +35,6 @@ Analyzer::Analyzer() : juce::Thread ("TC Spectrum Analyzer")
     for (auto& v : bandMax) v.store (0.0f);
     for (auto& v : rmsDb) v.store (-200.0f);
     for (auto& v : tpSinceRead) v.store (-200.0f);
-    history.clear();
 }
 
 Analyzer::~Analyzer()
@@ -109,8 +109,6 @@ void Analyzer::run()
             const auto scope = fifo.read (ready);
             if (scope.blockSize1 > 0) processChunk (scope.startIndex1, scope.blockSize1);
             if (scope.blockSize2 > 0) processChunk (scope.startIndex2, scope.blockSize2);
-            if (spectrumActive.load (std::memory_order_relaxed))
-                runSpectrum();
         }
 
         wait (4);
@@ -142,52 +140,105 @@ void Analyzer::rebuildBands()
         specs.push_back ({ f, lo, f * edge });
     }
 
-    // each band gets the shortest FFT whose bins are <= 1/6 of its width,
-    // so a tone in one band stays ~60 dB down in the next (Blackman-Harris main lobe)
-    resolutions.clear();
+    // each band runs at the lowest sample rate that keeps >= 4x headroom above its upper edge
     bands.clear();
-    std::array<int, maxOrder + 1> orderToIndex;
-    orderToIndex.fill (-1);
-
-    for (auto& s : specs)
+    bands.resize (specs.size());
+    int maxLevel = 0;
+    for (size_t i = 0; i < specs.size(); ++i)
     {
-        const double bw = s.hi - s.lo;
-        const int order = juce::jlimit (8, maxOrder, (int) std::ceil (std::log2 (6.0 * fs / bw)));
+        int k = (int) std::floor (std::log2 (fs / (4.0 * specs[i].hi)));
+        k = juce::jlimit (0, 12, k);
+        bands[i].level = k;
+        bands[i].freq = (float) specs[i].f;
+        maxLevel = juce::jmax (maxLevel, k);
+    }
 
-        if (orderToIndex[(size_t) order] < 0)
+    levels.clear();
+    levels.resize ((size_t) maxLevel + 1);
+    // 8th-order Butterworth decimation filter at 0.15 fs_in: -0.2 dB at the top band, aliases < -60 dB
+    const double butterQ[4] = { 0.5097955791, 0.6013448869, 0.8999762231, 2.5629154477 };
+    for (int k = 0; k <= maxLevel; ++k)
+    {
+        auto& L = levels[(size_t) k];
+        L.rate = fs / std::pow (2.0, k);
+        if (k > 0)
         {
-            orderToIndex[(size_t) order] = (int) resolutions.size();
-            Resolution r;
-            r.order = order;
-            r.size = 1 << order;
-            r.hop = juce::jlimit (256, 4096, r.size / 4);
-            r.fft = std::make_unique<juce::dsp::FFT> (order);
-            r.window.resize ((size_t) r.size);
-            r.buffer.assign ((size_t) r.size * 2, 0.0f);
-            double sumW2 = 0.0;
-            for (int i = 0; i < r.size; ++i)
+            const double inRate = fs / std::pow (2.0, k - 1);
+            for (int s = 0; s < 4; ++s)
             {
-                const double x = 2.0 * pi * i / (r.size - 1);
-                const double w = 0.35875 - 0.48829 * std::cos (x) + 0.14128 * std::cos (2.0 * x) - 0.01168 * std::cos (3.0 * x);
-                r.window[(size_t) i] = (float) w;
-                sumW2 += w * w;
+                auto& q = L.lp[(size_t) s];
+                const double w0 = 2.0 * pi * 0.15;
+                const double alpha = std::sin (w0) / (2.0 * butterQ[s]);
+                const double c = std::cos (w0), a0 = 1.0 + alpha;
+                q.b0 = (float) ((1.0 - c) * 0.5 / a0);
+                q.b1 = (float) ((1.0 - c) / a0);
+                q.b2 = q.b0;
+                q.a1 = (float) (-2.0 * c / a0);
+                q.a2 = (float) ((1.0 - alpha) / a0);
+                juce::ignoreUnused (inRate);
             }
-            r.norm = (float) (2.0 / ((double) r.size * sumW2));
-            resolutions.push_back (std::move (r));
+        }
+    }
+
+    // Chebyshev type I band-pass, prototype order 7 (0.5 dB ripple) -> 7 biquads, 14th order.
+    // A tone at the centre of a band is ~60 dB down in the neighbouring bands.
+    constexpr int order = 7;
+    const double rippleDb = 0.5;
+    const double eps = std::sqrt (std::pow (10.0, rippleDb / 10.0) - 1.0);
+    const double mu = std::asinh (1.0 / eps) / order;
+    using C = std::complex<double>;
+
+    for (size_t i = 0; i < specs.size(); ++i)
+    {
+        auto& b = bands[i];
+        const double rate = levels[(size_t) b.level].rate;
+        const double T2 = 2.0 * rate;
+        const double wl = T2 * std::tan (pi * specs[i].lo / rate);   // pre-warped edges
+        const double wh = T2 * std::tan (pi * specs[i].hi / rate);
+        const double w0sq = wl * wh, bw = wh - wl;
+
+        b.numSections = 0;
+        auto addPole = [&] (C s)
+        {
+            const C z = (1.0 + s / T2) / (1.0 - s / T2);
+            auto& sec = b.sec[(size_t) b.numSections++];
+            sec.a1 = -2.0 * z.real();
+            sec.a2 = std::norm (z);
+            sec.b0 = 1.0;
+        };
+
+        for (int k = 1; k <= order; ++k)
+        {
+            const double theta = (2.0 * k - 1.0) * pi / (2.0 * order);
+            const C p (-std::sinh (mu) * std::sin (theta), std::cosh (mu) * std::cos (theta));
+            if (p.imag() < -1.0e-12)
+                continue;                                    // conjugates are implied
+            // low-pass -> band-pass: s^2 - p B s + w0^2 = 0
+            const C disc = std::sqrt (p * p * bw * bw - 4.0 * w0sq);
+            const C s1 = (p * bw + disc) * 0.5, s2 = (p * bw - disc) * 0.5;
+            if (std::abs (p.imag()) <= 1.0e-12)
+                addPole (s1.imag() >= 0.0 ? s1 : s2);        // real prototype pole -> one conjugate pair
+            else
+            {
+                addPole (s1);
+                addPole (s2);
+            }
         }
 
-        const int ri = orderToIndex[(size_t) order];
-        auto& r = resolutions[(size_t) ri];
-        const double df = fs / r.size;
-        Band b;
-        b.freq = (float) s.f;
-        b.resolution = ri;
-        b.binLo = juce::jlimit (1, r.size / 2, (int) std::ceil (s.lo / df));
-        b.binHi = juce::jlimit (1, r.size / 2, (int) std::ceil (s.hi / df) - 1);
-        if (b.binHi < b.binLo)
-            b.binLo = b.binHi = juce::jlimit (1, r.size / 2, (int) std::round (s.f / df));
-        r.bands.push_back ((int) bands.size());
-        bands.push_back (b);
+        // normalise the gain to 1 at the (pre-warped) centre: a passband peak for odd order
+        const double wc = 2.0 * std::atan (std::sqrt (w0sq) / T2);
+        const C zc = std::polar (1.0, -wc), zc2 = zc * zc;
+        C h (1.0, 0.0);
+        for (int s = 0; s < b.numSections; ++s)
+        {
+            const auto& sec = b.sec[(size_t) s];
+            h *= (1.0 - zc2) / (1.0 + sec.a1 * zc + sec.a2 * zc2);
+        }
+        const double g = std::pow (1.0 / std::abs (h), 1.0 / b.numSections);
+        for (int s = 0; s < b.numSections; ++s)
+            b.sec[(size_t) s].b0 = g;
+
+        levels[(size_t) b.level].bands.push_back ((int) i);
     }
 
     {
@@ -198,6 +249,7 @@ void Analyzer::rebuildBands()
         numBandsPublished.store ((int) bands.size());
     }
 
+    silentSamples.fill (0.0);
     for (auto& v : bandPow) v.store (0.0f);
     for (auto& v : bandMax) v.store (0.0f);
     layoutVersion.fetch_add (1);
@@ -285,75 +337,85 @@ void Analyzer::processChunk (int start, int numSamples)
         atomicMax (tpSinceRead[(size_t) ch], tpDb);
         atomicMax (tpMaxDb, tpDb);
 
-        // ---------------- history for the FFTs ----------------
-        if (doSpectrum)
-        {
-            if (peak > 0.0f)
-                lastSound[(size_t) ch] = totalSamples + numSamples;
+        // ---------------- spectrum ----------------
+        if (! doSpectrum || bands.empty())
+            continue;
 
-            float* h = history.getWritePointer (ch);
-            int pos = historyPos;
-            int remaining = numSamples, offset = 0;
-            while (remaining > 0)
+        if ((hiddenMask.load (std::memory_order_relaxed) >> ch) & 1u)
+        {
+            for (size_t bi = 0; bi < bands.size(); ++bi)
+                bandPow[(size_t) ch * maxBands + bi].store (0.0f, std::memory_order_relaxed);
+            continue;
+        }
+
+        auto& silent = silentSamples[(size_t) ch];
+        silent = peak > 0.0f ? 0.0 : silent + numSamples;
+        if (silent > sampleRate.load())
+        {
+            // more than a second of digital silence: the filters have rung out, skip the work
+            for (size_t bi = 0; bi < bands.size(); ++bi)
+                bandPow[(size_t) ch * maxBands + bi].store (0.0f, std::memory_order_relaxed);
+            continue;
+        }
+
+        for (auto& b : bands) { b.mx[(size_t) ch] = 0.0f; b.sum[(size_t) ch] = 0.0; }
+        std::array<int, 16> levelCount {};
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            float v = x[i];
+            size_t k = 0;
+            for (;;)
             {
-                const int n = juce::jmin (remaining, historySize - pos);
-                std::memcpy (h + pos, x + offset, (size_t) n * sizeof (float));
-                std::memcpy (h + pos + historySize, x + offset, (size_t) n * sizeof (float));
-                pos = (pos + n) & (historySize - 1);
-                offset += n;
-                remaining -= n;
+                auto& L = levels[k];
+                ++levelCount[k];
+                for (int bi : L.bands)
+                {
+                    auto& b = bands[(size_t) bi];
+                    auto& st = b.state[(size_t) ch];
+                    double y = v;
+                    for (int s = 0; s < b.numSections; ++s)
+                    {
+                        const auto& sec = b.sec[(size_t) s];
+                        double& s1 = st[(size_t) (2 * s)];
+                        double& s2 = st[(size_t) (2 * s + 1)];
+                        const double in = y;
+                        y = sec.b0 * in + s1;
+                        s1 = -sec.a1 * y + s2;
+                        s2 = -sec.b0 * in - sec.a2 * y;
+                    }
+                    const float p = (float) (y * y);
+                    b.sum[(size_t) ch] += p;
+                    b.mx[(size_t) ch] = juce::jmax (b.mx[(size_t) ch], p);
+                }
+
+                if (k + 1 >= levels.size())
+                    break;
+
+                auto& next = levels[k + 1];
+                auto& ls = next.lpState[(size_t) ch];
+                float f = next.lp[0].process (v, ls[0], ls[1]);
+                f = next.lp[1].process (f, ls[2], ls[3]);
+                f = next.lp[2].process (f, ls[4], ls[5]);
+                f = next.lp[3].process (f, ls[6], ls[7]);
+
+                auto& ph = next.phase[(size_t) ch];
+                ph ^= 1;
+                if (ph == 0)
+                    break;           // keep every second sample
+                v = f;
+                ++k;
             }
         }
-    }
 
-    if (doSpectrum)
-    {
-        historyPos = (historyPos + numSamples) & (historySize - 1);
-        totalSamples += numSamples;
-    }
-}
-
-void Analyzer::runSpectrum()
-{
-    const int numCh = numChannels.load();
-
-    for (auto& r : resolutions)
-    {
-        if (r.bands.empty() || totalSamples - r.lastRun < r.hop)
-            continue;
-        r.lastRun = totalSamples;
-
-        for (int ch = 0; ch < numCh; ++ch)
+        for (size_t bi = 0; bi < bands.size(); ++bi)
         {
-            if (totalSamples - lastSound[(size_t) ch] > r.size)
-            {
-                // the whole window is digital silence: skip the FFT
-                for (int bi : r.bands)
-                    bandPow[(size_t) ch * maxBands + (size_t) bi].store (0.0f, std::memory_order_relaxed);
-                continue;
-            }
-
-            // the last r.size samples, contiguous thanks to the doubled history
-            const float* src = history.getReadPointer (ch) + historyPos + historySize - r.size;
-            float* buf = r.buffer.data();
-            juce::FloatVectorOperations::multiply (buf, src, r.window.data(), r.size);
-            std::fill (buf + r.size, buf + 2 * r.size, 0.0f);
-            r.fft->performRealOnlyForwardTransform (buf, true);
-
-            for (int bi : r.bands)
-            {
-                const auto& b = bands[(size_t) bi];
-                float sum = 0.0f;
-                for (int k = b.binLo; k <= b.binHi; ++k)
-                {
-                    const float re = buf[2 * k], im = buf[2 * k + 1];
-                    sum += re * re + im * im;
-                }
-                const float p = sum * r.norm;
-                const size_t idx = (size_t) ch * maxBands + (size_t) bi;
-                bandPow[idx].store (p, std::memory_order_relaxed);
-                atomicMax (bandMax[idx], p);
-            }
+            auto& b = bands[bi];
+            const int n = levelCount[(size_t) b.level];
+            const size_t idx = (size_t) ch * maxBands + bi;
+            if (n > 0)
+                bandPow[idx].store ((float) (b.sum[(size_t) ch] / n), std::memory_order_relaxed);
+            atomicMax (bandMax[idx], b.mx[(size_t) ch]);
         }
     }
 }

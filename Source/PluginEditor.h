@@ -5,11 +5,17 @@
 #include "MeterView.h"
 #include "Theme.h"
 
-class TCSpectrumAnalyzerEditor : public juce::AudioProcessorEditor
+// All the plugin UI, laid out at a fixed base size. The editor scales it uniformly,
+// so the window keeps the same proportions (and the graph the PAZ's) at every size.
+class MainPanel : public juce::Component
 {
 public:
-    explicit TCSpectrumAnalyzerEditor (TCSpectrumAnalyzerProcessor&);
-    ~TCSpectrumAnalyzerEditor() override;
+    explicit MainPanel (TCSpectrumAnalyzerProcessor&);
+    ~MainPanel() override;
+
+    static constexpr int baseHeight = 500;
+    int getBaseWidth() const { return meterButton.getToggleState() ? 1000 : 760; }
+    std::function<void()> onBaseSizeChanged;
 
     void paint (juce::Graphics&) override;
     void resized() override;
@@ -54,6 +60,24 @@ private:
 
     double lastTick = 0.0;
     juce::VBlankAttachment vblank;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainPanel)
+};
+
+class TCSpectrumAnalyzerEditor : public juce::AudioProcessorEditor
+{
+public:
+    explicit TCSpectrumAnalyzerEditor (TCSpectrumAnalyzerProcessor&);
+    ~TCSpectrumAnalyzerEditor() override;
+
+    void resized() override;
+
+private:
+    void applyBaseSize (float scale);
+
+    TCSpectrumAnalyzerProcessor& proc;
+    MainPanel panel;
+    float currentScale = 1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TCSpectrumAnalyzerEditor)
 };
