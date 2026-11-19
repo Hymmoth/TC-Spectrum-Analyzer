@@ -5,33 +5,6 @@ namespace
 {
     constexpr double pi = 3.14159265358979323846;
 
-    // RBJ band-pass, 0 dB peak gain
-    void designBandPass (float& b0, float& b1, float& b2, float& a1, float& a2, double f, double q, double fs)
-    {
-        const double w0 = 2.0 * pi * f / fs;
-        const double alpha = std::sin (w0) / (2.0 * q);
-        const double a0 = 1.0 + alpha;
-        b0 = (float) (alpha / a0);
-        b1 = 0.0f;
-        b2 = (float) (-alpha / a0);
-        a1 = (float) (-2.0 * std::cos (w0) / a0);
-        a2 = (float) ((1.0 - alpha) / a0);
-    }
-
-    // RBJ low-pass
-    void designLowPass (float& b0, float& b1, float& b2, float& a1, float& a2, double f, double q, double fs)
-    {
-        const double w0 = 2.0 * pi * f / fs;
-        const double alpha = std::sin (w0) / (2.0 * q);
-        const double c = std::cos (w0);
-        const double a0 = 1.0 + alpha;
-        b0 = (float) ((1.0 - c) * 0.5 / a0);
-        b1 = (float) ((1.0 - c) / a0);
-        b2 = b0;
-        a1 = (float) (-2.0 * c / a0);
-        a2 = (float) ((1.0 - alpha) / a0);
-    }
-
     double besselI0 (double x)
     {
         double sum = 1.0, term = 1.0;
@@ -61,6 +34,7 @@ Analyzer::Analyzer() : juce::Thread ("TC Spectrum Analyzer")
     for (auto& v : bandMax) v.store (0.0f);
     for (auto& v : rmsDb) v.store (-200.0f);
     for (auto& v : tpSinceRead) v.store (-200.0f);
+    history.clear();
 }
 
 Analyzer::~Analyzer()
@@ -116,15 +90,12 @@ void Analyzer::run()
     {
         if (needsRebuild.exchange (false))
         {
-            rebuildFilterBank();
+            rebuildBands();
             rebuildMeters();
         }
 
         if (lfResHz.load() != builtLfRes)
-            rebuildFilterBank();
-
-        if (responseMs.load() != builtResponse || detectRms.load() != builtDetect)
-            updateEnvelopeCoeffs();
+            rebuildBands();
 
         if (resetMeterRequest.exchange (false))
         {
@@ -138,72 +109,85 @@ void Analyzer::run()
             const auto scope = fifo.read (ready);
             if (scope.blockSize1 > 0) processChunk (scope.startIndex1, scope.blockSize1);
             if (scope.blockSize2 > 0) processChunk (scope.startIndex2, scope.blockSize2);
+            if (spectrumActive.load (std::memory_order_relaxed))
+                runSpectrum();
         }
 
-        wait (5);
+        wait (4);
     }
 }
 
-void Analyzer::rebuildFilterBank()
+void Analyzer::rebuildBands()
 {
     const double fs = sampleRate.load();
-    const int lf = juce::jlimit (5, 100, lfResHz.load());
     builtLfRes = lfResHz.load();
+    const double lf = juce::jlimit (5, 100, builtLfRes);
 
-    struct Spec { double f, q; };
+    struct Spec { double f, lo, hi; };
     std::vector<Spec> specs;
 
     // below 250 Hz: constant bandwidth (= LF resolution), like the PAZ
-    for (int f = lf; f < 250 && (int) specs.size() < maxBands; f += lf)
-        specs.push_back ({ (double) f, (double) f / (double) lf });
+    for (double f = lf; f < 250.0 && (int) specs.size() < maxBands; f += lf)
+        specs.push_back ({ f, f - lf * 0.5, f + lf * 0.5 });
 
-    // above 250 Hz: 1/7 octave spacing, Q ~ 10
-    const double top = juce::jmin (20000.0, fs * 0.42);
+    // above 250 Hz: 1/7 octave bands, Q ~ 10
+    const double top = juce::jmin (20000.0, fs * 0.45);
+    const double edge = std::pow (2.0, 1.0 / 14.0);
     for (int n = 0; (int) specs.size() < maxBands; ++n)
     {
         const double f = 250.0 * std::pow (2.0, n / 7.0);
         if (f > top) break;
-        specs.push_back ({ f, 10.0 });
+        double lo = f / edge;
+        if (! specs.empty()) lo = juce::jmax (lo, specs.back().hi);
+        specs.push_back ({ f, lo, f * edge });
     }
 
-    // assign each band to the lowest sample rate that still has >= 8x headroom
+    // each band gets the shortest FFT whose bins are <= 1/6 of its width,
+    // so a tone in one band stays ~60 dB down in the next (Blackman-Harris main lobe)
+    resolutions.clear();
     bands.clear();
-    bands.resize (specs.size());
-    int maxLevel = 0;
-    for (size_t i = 0; i < specs.size(); ++i)
-    {
-        const double fHigh = specs[i].f * (1.0 + 0.5 / specs[i].q);
-        int k = (int) std::floor (std::log2 (fs / (8.0 * fHigh)));
-        k = juce::jlimit (0, 12, k);
-        bands[i].level = k;
-        bands[i].freq = (float) specs[i].f;
-        maxLevel = juce::jmax (maxLevel, k);
-    }
+    std::array<int, maxOrder + 1> orderToIndex;
+    orderToIndex.fill (-1);
 
-    levels.clear();
-    levels.resize ((size_t) maxLevel + 1);
-    const double butterQ[3] = { 0.5176380902, 0.7071067812, 1.9318516526 };
-    for (int k = 0; k <= maxLevel; ++k)
+    for (auto& s : specs)
     {
-        auto& L = levels[(size_t) k];
-        L.rate = fs / std::pow (2.0, k);
-        if (k > 0)
+        const double bw = s.hi - s.lo;
+        const int order = juce::jlimit (8, maxOrder, (int) std::ceil (std::log2 (6.0 * fs / bw)));
+
+        if (orderToIndex[(size_t) order] < 0)
         {
-            const double inRate = fs / std::pow (2.0, k - 1);
-            for (int s = 0; s < 3; ++s)
-                designLowPass (L.lp[(size_t) s].b0, L.lp[(size_t) s].b1, L.lp[(size_t) s].b2,
-                               L.lp[(size_t) s].a1, L.lp[(size_t) s].a2, 0.15 * inRate, butterQ[s], inRate);
+            orderToIndex[(size_t) order] = (int) resolutions.size();
+            Resolution r;
+            r.order = order;
+            r.size = 1 << order;
+            r.hop = juce::jlimit (256, 4096, r.size / 4);
+            r.fft = std::make_unique<juce::dsp::FFT> (order);
+            r.window.resize ((size_t) r.size);
+            r.buffer.assign ((size_t) r.size * 2, 0.0f);
+            double sumW2 = 0.0;
+            for (int i = 0; i < r.size; ++i)
+            {
+                const double x = 2.0 * pi * i / (r.size - 1);
+                const double w = 0.35875 - 0.48829 * std::cos (x) + 0.14128 * std::cos (2.0 * x) - 0.01168 * std::cos (3.0 * x);
+                r.window[(size_t) i] = (float) w;
+                sumW2 += w * w;
+            }
+            r.norm = (float) (2.0 / ((double) r.size * sumW2));
+            resolutions.push_back (std::move (r));
         }
-    }
 
-    // two identical 2nd-order sections: per-section Q so the cascade has the target bandwidth
-    const double cascadeFactor = std::sqrt (std::sqrt (2.0) - 1.0);
-    for (size_t i = 0; i < bands.size(); ++i)
-    {
-        auto& b = bands[i];
-        const double rate = levels[(size_t) b.level].rate;
-        designBandPass (b.bp.b0, b.bp.b1, b.bp.b2, b.bp.a1, b.bp.a2, specs[i].f, specs[i].q * cascadeFactor, rate);
-        levels[(size_t) b.level].bands.push_back ((int) i);
+        const int ri = orderToIndex[(size_t) order];
+        auto& r = resolutions[(size_t) ri];
+        const double df = fs / r.size;
+        Band b;
+        b.freq = (float) s.f;
+        b.resolution = ri;
+        b.binLo = juce::jlimit (1, r.size / 2, (int) std::ceil (s.lo / df));
+        b.binHi = juce::jlimit (1, r.size / 2, (int) std::ceil (s.hi / df) - 1);
+        if (b.binHi < b.binLo)
+            b.binLo = b.binHi = juce::jlimit (1, r.size / 2, (int) std::round (s.f / df));
+        r.bands.push_back ((int) bands.size());
+        bands.push_back (b);
     }
 
     {
@@ -217,25 +201,6 @@ void Analyzer::rebuildFilterBank()
     for (auto& v : bandPow) v.store (0.0f);
     for (auto& v : bandMax) v.store (0.0f);
     layoutVersion.fetch_add (1);
-
-    builtResponse = -1.0f;
-    updateEnvelopeCoeffs();
-}
-
-void Analyzer::updateEnvelopeCoeffs()
-{
-    builtResponse = responseMs.load();
-    builtDetect = detectRms.load();
-    const double tau = juce::jlimit (1.0, 10000.0, (double) builtResponse) * 0.001;
-
-    for (auto& b : bands)
-    {
-        const double rate = levels[(size_t) b.level].rate;
-        if (builtDetect == 1)
-            b.coeff = (float) (1.0 - std::exp (-1.0 / (tau * rate)));    // RMS: one-pole on x^2
-        else
-            b.coeff = (float) std::exp (-2.0 / (tau * rate));            // Peak: release of the squared envelope
-    }
 }
 
 void Analyzer::rebuildMeters()
@@ -276,8 +241,7 @@ void Analyzer::rebuildMeters()
 void Analyzer::processChunk (int start, int numSamples)
 {
     const int numCh = numChannels.load();
-    const bool doSpectrum = spectrumActive.load (std::memory_order_relaxed) && ! bands.empty();
-    const bool rms = builtDetect == 1;
+    const bool doSpectrum = spectrumActive.load (std::memory_order_relaxed);
 
     for (int ch = 0; ch < numCh; ++ch)
     {
@@ -321,57 +285,75 @@ void Analyzer::processChunk (int start, int numSamples)
         atomicMax (tpSinceRead[(size_t) ch], tpDb);
         atomicMax (tpMaxDb, tpDb);
 
-        // ---------------- spectrum ----------------
-        if (! doSpectrum)
-            continue;
-
-        for (int i = 0; i < numSamples; ++i)
+        // ---------------- history for the FFTs ----------------
+        if (doSpectrum)
         {
-            float v = x[i];
-            size_t k = 0;
-            for (;;)
+            if (peak > 0.0f)
+                lastSound[(size_t) ch] = totalSamples + numSamples;
+
+            float* h = history.getWritePointer (ch);
+            int pos = historyPos;
+            int remaining = numSamples, offset = 0;
+            while (remaining > 0)
             {
-                auto& L = levels[k];
-                for (int bi : L.bands)
-                {
-                    auto& b = bands[(size_t) bi];
-                    auto& st = b.state[(size_t) ch];
-                    float y = b.bp.process (v, st[0], st[1]);
-                    y = b.bp.process (y, st[2], st[3]);
-                    const float p = y * y;
-                    float& e = b.env[(size_t) ch];
-                    if (rms)
-                        e += b.coeff * (p - e);
-                    else
-                        e = juce::jmax (p, e * b.coeff);
-                    b.mx[(size_t) ch] = juce::jmax (b.mx[(size_t) ch], e);
-                }
-
-                if (k + 1 >= levels.size())
-                    break;
-
-                auto& next = levels[k + 1];
-                auto& ls = next.lpState[(size_t) ch];
-                float f = next.lp[0].process (v, ls[0], ls[1]);
-                f = next.lp[1].process (f, ls[2], ls[3]);
-                f = next.lp[2].process (f, ls[4], ls[5]);
-
-                auto& ph = next.phase[(size_t) ch];
-                ph ^= 1;
-                if (ph == 0)
-                    break;           // drop every second sample
-                v = f;
-                ++k;
+                const int n = juce::jmin (remaining, historySize - pos);
+                std::memcpy (h + pos, x + offset, (size_t) n * sizeof (float));
+                std::memcpy (h + pos + historySize, x + offset, (size_t) n * sizeof (float));
+                pos = (pos + n) & (historySize - 1);
+                offset += n;
+                remaining -= n;
             }
         }
+    }
 
-        for (size_t bi = 0; bi < bands.size(); ++bi)
+    if (doSpectrum)
+    {
+        historyPos = (historyPos + numSamples) & (historySize - 1);
+        totalSamples += numSamples;
+    }
+}
+
+void Analyzer::runSpectrum()
+{
+    const int numCh = numChannels.load();
+
+    for (auto& r : resolutions)
+    {
+        if (r.bands.empty() || totalSamples - r.lastRun < r.hop)
+            continue;
+        r.lastRun = totalSamples;
+
+        for (int ch = 0; ch < numCh; ++ch)
         {
-            auto& b = bands[bi];
-            const size_t idx = (size_t) ch * maxBands + bi;
-            bandPow[idx].store (b.env[(size_t) ch], std::memory_order_relaxed);
-            atomicMax (bandMax[idx], b.mx[(size_t) ch]);
-            b.mx[(size_t) ch] = 0.0f;
+            if (totalSamples - lastSound[(size_t) ch] > r.size)
+            {
+                // the whole window is digital silence: skip the FFT
+                for (int bi : r.bands)
+                    bandPow[(size_t) ch * maxBands + (size_t) bi].store (0.0f, std::memory_order_relaxed);
+                continue;
+            }
+
+            // the last r.size samples, contiguous thanks to the doubled history
+            const float* src = history.getReadPointer (ch) + historyPos + historySize - r.size;
+            float* buf = r.buffer.data();
+            juce::FloatVectorOperations::multiply (buf, src, r.window.data(), r.size);
+            std::fill (buf + r.size, buf + 2 * r.size, 0.0f);
+            r.fft->performRealOnlyForwardTransform (buf, true);
+
+            for (int bi : r.bands)
+            {
+                const auto& b = bands[(size_t) bi];
+                float sum = 0.0f;
+                for (int k = b.binLo; k <= b.binHi; ++k)
+                {
+                    const float re = buf[2 * k], im = buf[2 * k + 1];
+                    sum += re * re + im * im;
+                }
+                const float p = sum * r.norm;
+                const size_t idx = (size_t) ch * maxBands + (size_t) bi;
+                bandPow[idx].store (p, std::memory_order_relaxed);
+                atomicMax (bandMax[idx], p);
+            }
         }
     }
 }

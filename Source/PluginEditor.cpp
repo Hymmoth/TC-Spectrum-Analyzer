@@ -43,10 +43,6 @@ TCSpectrumAnalyzerEditor::TCSpectrumAnalyzerEditor (TCSpectrumAnalyzerProcessor&
 {
     setLookAndFeel (&lnf);
 
-    glContext.setComponentPaintingEnabled (true);
-    glContext.setContinuousRepainting (false);
-    glContext.attachTo (*this);
-
     addAndMakeVisible (spectrum);
     addAndMakeVisible (meter);
 
@@ -113,25 +109,24 @@ TCSpectrumAnalyzerEditor::TCSpectrumAnalyzerEditor (TCSpectrumAnalyzerProcessor&
 
     groups = {
         { "Detect",     &detect,         nullptr, 116, 0,   {}, nullptr },
-        { "Response",   &response,       nullptr, 150, 0, {}, &responseValue },
-        { "Peak Hold",  &peakHoldButton, &fall,   52, 130, {}, &fallValue },
-        { "LF Res",     &lfRes,          nullptr, 186, 0,   {}, nullptr },
-        { "Weighting",  &weighting,      nullptr, 168, 0,   {}, nullptr },
-        { "Show",       &show,           nullptr, 290, 0,   {}, nullptr },
+        { "Response",   &response,       nullptr, 130, 0, {}, &responseValue },
+        { "Peak Hold",  &peakHoldButton, &fall,   48, 110, {}, &fallValue },
+        { "LF Res",     &lfRes,          nullptr, 168, 0,   {}, nullptr },
+        { "Weighting",  &weighting,      nullptr, 150, 0,   {}, nullptr },
+        { "Show",       &show,           nullptr, 250, 0,   {}, nullptr },
     };
 
     proc.analyzer.spectrumActive.store (true);
 
     setResizable (true, true);
-    setResizeLimits (820, 480, 2800, 1600);
-    setSize (juce::jlimit (820, 2800, proc.editorWidth.load()), juce::jlimit (480, 1600, proc.editorHeight.load()));
+    setResizeLimits (560, 400, 2800, 1600);
+    setSize (juce::jlimit (560, 2800, proc.editorWidth.load()), juce::jlimit (400, 1600, proc.editorHeight.load()));
     lastTick = juce::Time::getMillisecondCounterHiRes();
 }
 
 TCSpectrumAnalyzerEditor::~TCSpectrumAnalyzerEditor()
 {
     proc.analyzer.spectrumActive.store (false);
-    glContext.detach();
     setLookAndFeel (nullptr);
 }
 
@@ -191,7 +186,7 @@ int TCSpectrumAnalyzerEditor::bottomRowsNeeded (int width) const
     {
         const int w = g.widthA + (g.b ? g.widthB + 8 : 0);
         if (x > 0 && x + w > width) { ++rows; x = 0; }
-        x += w + 22;
+        x += w + (getWidth() < 900 ? 12 : 22);
     }
     return rows;
 }
@@ -215,7 +210,7 @@ void TCSpectrumAnalyzerEditor::layoutBottom (juce::Rectangle<int> area)
             const int captionW = juce::roundToInt (juce::GlyphArrangement::getStringWidth (Theme::font (11.5f), g.caption)) + 8;
             g.valueLabel->setBounds (x + captionW, y + 2, 90, 20);
         }
-        x += w + 22;
+        x += w + (getWidth() < 900 ? 12 : 22);
     }
 }
 
@@ -227,28 +222,30 @@ void TCSpectrumAnalyzerEditor::resized()
     auto r = getLocalBounds();
     topBar = r.removeFromTop (44);
 
-    auto t = topBar.reduced (14, 8);
-    meterButton.setBounds (t.removeFromRight (64));
-    t.removeFromRight (8);
-    coloursButton.setBounds (t.removeFromRight (80));
-    t.removeFromRight (8);
-    resetButton.setBounds (t.removeFromRight (100));
-    t.removeFromRight (8);
-    freezeButton.setBounds (t.removeFromRight (72));
+    const bool compact = getWidth() < 900;
+    auto t = topBar.reduced (compact ? 8 : 14, 8);
+    const int gap = compact ? 4 : 8;
+    meterButton.setBounds (t.removeFromRight (compact ? 52 : 64));
+    t.removeFromRight (gap);
+    coloursButton.setBounds (t.removeFromRight (compact ? 64 : 80));
+    t.removeFromRight (gap);
+    resetButton.setBounds (t.removeFromRight (compact ? 86 : 100));
+    t.removeFromRight (gap);
+    freezeButton.setBounds (t.removeFromRight (compact ? 60 : 72));
     badgeArea = t;
 
-    auto content = r.reduced (14, 0);
+    auto content = r.reduced (compact ? 8 : 14, 0);
     const int rows = bottomRowsNeeded (content.getWidth());
-    auto bottom = content.removeFromBottom (52 * rows + 10);
-    content.removeFromTop (12);
-    content.removeFromBottom (4);
+    auto bottom = content.removeFromBottom (52 * rows + 6);
+    content.removeFromTop (compact ? 8 : 12);
+    content.removeFromBottom (2);
 
     const bool showMeter = meterButton.getToggleState();
     meter.setVisible (showMeter);
     if (showMeter)
     {
-        meter.setBounds (content.removeFromRight (240));
-        content.removeFromRight (12);
+        meter.setBounds (content.removeFromRight (getWidth() < 760 ? 176 : 240));
+        content.removeFromRight (compact ? 8 : 12);
     }
     spectrum.setBounds (content);
 
@@ -264,11 +261,12 @@ void TCSpectrumAnalyzerEditor::paint (juce::Graphics& g)
     g.setColour (Theme::panelBorder);
     g.fillRect (topBar.getX(), topBar.getBottom() - 1, topBar.getWidth(), 1);
 
-    auto t = badgeArea.withTrimmedLeft (14);
+    auto t = badgeArea.withTrimmedLeft (getWidth() < 900 ? 6 : 14);
     g.setColour (Theme::textBright);
-    g.setFont (Theme::font (15.0f, true));
-    const juce::String title ("TC SPECTRUM ANALYZER");
-    const int titleW = juce::roundToInt (juce::GlyphArrangement::getStringWidth (Theme::font (15.0f, true), title)) + 4;
+    const float titleSize = getWidth() < 700 ? 12.5f : 15.0f;
+    g.setFont (Theme::font (titleSize, true));
+    const juce::String title (getWidth() < 640 ? "TC SPECTRUM" : "TC SPECTRUM ANALYZER");
+    const int titleW = juce::jmin (t.getWidth(), juce::roundToInt (juce::GlyphArrangement::getStringWidth (Theme::font (titleSize, true), title)) + 4);
     g.drawText (title, t.removeFromLeft (titleW), juce::Justification::centredLeft);
 
     t.removeFromLeft (14);

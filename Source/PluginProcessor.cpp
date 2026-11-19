@@ -63,7 +63,7 @@ TCSpectrumAnalyzerProcessor::TCSpectrumAnalyzerProcessor()
                         .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "TCSA", createLayout())
 {
-    for (auto* id : { ParamIDs::detect, ParamIDs::response, ParamIDs::lfRes })
+    for (auto* id : { ParamIDs::lfRes })
     {
         apvts.addParameterListener (id, this);
         parameterChanged (id, apvts.getRawParameterValue (id)->load());
@@ -73,16 +73,15 @@ TCSpectrumAnalyzerProcessor::TCSpectrumAnalyzerProcessor()
 
 TCSpectrumAnalyzerProcessor::~TCSpectrumAnalyzerProcessor()
 {
-    for (auto* id : { ParamIDs::detect, ParamIDs::response, ParamIDs::lfRes })
+    for (auto* id : { ParamIDs::lfRes })
         apvts.removeParameterListener (id, this);
     analyzer.release();
 }
 
 void TCSpectrumAnalyzerProcessor::parameterChanged (const juce::String& id, float v)
 {
-    if (id == ParamIDs::detect)        analyzer.detectRms.store ((int) v);
-    else if (id == ParamIDs::response) analyzer.responseMs.store (v);
-    else if (id == ParamIDs::lfRes)    analyzer.lfResHz.store (v < 0.5f ? 10 : (v < 1.5f ? 20 : 40));
+    if (id == ParamIDs::lfRes)
+        analyzer.lfResHz.store (v < 0.5f ? 10 : (v < 1.5f ? 20 : 40));
 }
 
 bool TCSpectrumAnalyzerProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const

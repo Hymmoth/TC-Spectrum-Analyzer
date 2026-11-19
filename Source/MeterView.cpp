@@ -5,6 +5,7 @@ MeterView::MeterView (TCSpectrumAnalyzerProcessor& p)
 {
     kParam = proc.apvts.getRawParameterValue (ParamIDs::kScale);
     addAndMakeVisible (kButtons);
+    setOpaque (true);
     rms.fill (-200.0f);
     peak.fill (-200.0f);
     peakHoldTime.fill (0.0f);
@@ -60,7 +61,7 @@ void MeterView::resized()
 {
     auto r = getLocalBounds().reduced (10, 8);
     header = r.removeFromTop (26);
-    kButtons.setBounds (header.removeFromRight (156));
+    kButtons.setBounds (header.removeFromRight (juce::jmin (156, header.getWidth() - 64)));
     r.removeFromTop (12);
 
     auto readouts = r.removeFromBottom (42);
@@ -78,6 +79,7 @@ void MeterView::resized()
 
 void MeterView::paint (juce::Graphics& g)
 {
+    g.fillAll (Theme::window);
     auto bounds = getLocalBounds().toFloat();
     g.setColour (Theme::panel);
     g.fillRoundedRectangle (bounds, 6.0f);

@@ -60,6 +60,22 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Static background (panel, grid, labels), cached as an image and redrawn only when the view changes.
+class SpectrumView::Grid : public juce::Component
+{
+public:
+    explicit Grid (SpectrumView& o) : owner (o)
+    {
+        setInterceptsMouseClicks (false, false);
+        setBufferedToImage (true);
+        setOpaque (true);
+    }
+    void paint (juce::Graphics& g) override { owner.paintGrid (g); }
+private:
+    SpectrumView& owner;
+};
+
+// ---------------------------------------------------------------------------
 SpectrumView::SpectrumView (TCSpectrumAnalyzerProcessor& p)
     : proc (p), analyzer (p.analyzer)
 {
@@ -67,12 +83,20 @@ SpectrumView::SpectrumView (TCSpectrumAnalyzerProcessor& p)
     holdParam   = proc.apvts.getRawParameterValue (ParamIDs::peakHold);
     fallParam   = proc.apvts.getRawParameterValue (ParamIDs::fall);
     weightParam = proc.apvts.getRawParameterValue (ParamIDs::weighting);
+    detectParam = proc.apvts.getRawParameterValue (ParamIDs::detect);
+    responseParam = proc.apvts.getRawParameterValue (ParamIDs::response);
+
+    setOpaque (true);
+    grid = std::make_unique<Grid> (*this);
+    addAndMakeVisible (*grid);
 
     resetViewButton.onClick = [this] { resetView(); };
     addAndMakeVisible (resetViewButton);
 
     for (auto& c : holdDb) c.fill (-200.0f);
     for (auto& c : curDb)  c.fill (-200.0f);
+    for (auto& c : disp)   c.fill (0.0f);
+    sumDisp.fill (0.0f);
     sumDb.fill (-200.0f);
     sumHoldDb.fill (-200.0f);
     weights.fill (1.0f);
@@ -90,6 +114,13 @@ void SpectrumView::resetView()
 {
     dbTop = 0.0f; dbBottom = -80.0f;
     fLo = 16.0f; fHi = 22000.0f;
+    viewChanged();
+}
+
+void SpectrumView::viewChanged()
+{
+    if (grid != nullptr)
+        grid->repaint();
     repaint();
 }
 
@@ -175,6 +206,13 @@ void SpectrumView::tick (double dt)
         const float fallDb = fallSec > 0.0f ? (float) (20.0 / fallSec * dt) : 0.0f; // 20 dB per "fall" time
         const auto hidden = proc.hiddenChannels.load();
 
+        // ballistics, applied every frame so the motion is smooth whatever the FFT update rate
+        const bool rms = juce::roundToInt (detectParam->load()) == 1;
+        const double tau = juce::jmax (0.001, (double) responseParam->load() * 0.001);
+        const float peakDecay = (float) std::exp (-2.0 * dt / tau);   // power domain
+        const float rmsCoeff  = (float) (1.0 - std::exp (-dt / tau));
+        const float scale = rms ? 1.0f : 2.0f;                         // Peak: a sine reads its peak level
+
         std::array<float, Analyzer::maxBands> sp {}, smx {};
 
         for (int ch = 0; ch < numCh; ++ch)
@@ -182,13 +220,16 @@ void SpectrumView::tick (double dt)
             const bool shown = (hidden & ((juce::uint32) 1 << ch)) == 0;
             for (int b = 0; b < numBands; ++b)
             {
-                const float w = weights[(size_t) b];
+                const float w = weights[(size_t) b] * scale;
                 const float p  = analyzer.getBandPower (ch, b) * w;
                 const float mx = analyzer.takeBandMax (ch, b) * w;
-                curDb[(size_t) ch][(size_t) b] = powToDb (p);
+                float& d = disp[(size_t) ch][(size_t) b];
+                if (rms) d += rmsCoeff * (p - d);
+                else     d = juce::jmax (mx, d * peakDecay);
+                curDb[(size_t) ch][(size_t) b] = powToDb (d);
                 float& h = holdDb[(size_t) ch][(size_t) b];
                 h = juce::jmax (h - fallDb, powToDb (mx), -200.0f);
-                if (shown) { sp[(size_t) b] += p; smx[(size_t) b] += mx; }
+                if (shown) { sp[(size_t) b] += d; smx[(size_t) b] += mx; }
             }
         }
 
@@ -200,7 +241,9 @@ void SpectrumView::tick (double dt)
         }
     }
 
-    repaint();
+    repaint (plot.expanded (2));
+    if (mouseInPlot)
+        repaint (chipRow);
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +276,8 @@ void SpectrumView::resized()
     freqLabels = r.removeFromBottom (18);
     plot = r;
 
+    grid->setBounds (getLocalBounds());
+
     auto row = chipRow;
     resetViewButton.setBounds (row.removeFromRight (84));
     for (auto* c : chips)
@@ -264,8 +309,9 @@ juce::Path SpectrumView::makeCurve (const float* db, int n, bool closed) const
     return p;
 }
 
-void SpectrumView::paint (juce::Graphics& g)
+void SpectrumView::paintGrid (juce::Graphics& g)
 {
+    g.fillAll (Theme::window);
     auto bounds = getLocalBounds().toFloat();
     g.setColour (Theme::panel);
     g.fillRoundedRectangle (bounds, 6.0f);
@@ -302,7 +348,12 @@ void SpectrumView::paint (juce::Graphics& g)
         g.setColour (Theme::textDim);
         g.drawText (t, (int) x - 20, freqLabels.getY() + 2, 40, 14, juce::Justification::centred);
     }
+}
 
+void SpectrumView::paint (juce::Graphics&) {}
+
+void SpectrumView::paintOverChildren (juce::Graphics& g)
+{
     // ---- curves ----
     {
         juce::Graphics::ScopedSaveState ss (g);
@@ -392,6 +443,7 @@ void SpectrumView::mouseMove (const juce::MouseEvent& e)
 void SpectrumView::mouseExit (const juce::MouseEvent&)
 {
     mouseInPlot = false;
+    repaint (chipRow);
 }
 
 void SpectrumView::mouseDown (const juce::MouseEvent& e)
@@ -420,6 +472,7 @@ void SpectrumView::mouseDrag (const juce::MouseEvent& e)
     fLo = lo; fHi = hi;
 
     mousePos = e.position;
+    viewChanged();
 }
 
 void SpectrumView::mouseDoubleClick (const juce::MouseEvent& e)
@@ -455,4 +508,5 @@ void SpectrumView::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseW
         dbTop = juce::jmin (24.0f, top);
         dbBottom = juce::jmax (-160.0f, bottom);
     }
+    viewChanged();
 }

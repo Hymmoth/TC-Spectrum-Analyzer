@@ -1,6 +1,5 @@
 #pragma once
 
-#include <juce_opengl/juce_opengl.h>
 #include "PluginProcessor.h"
 #include "SpectrumView.h"
 #include "MeterView.h"
@@ -33,7 +32,6 @@ private:
 
     TCSpectrumAnalyzerProcessor& proc;
     TCLookAndFeel lnf;
-    juce::OpenGLContext glContext;
 
     SpectrumView spectrum;
     MeterView meter;

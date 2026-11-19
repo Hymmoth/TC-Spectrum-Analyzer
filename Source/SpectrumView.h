@@ -18,6 +18,7 @@ public:
     void refreshColours();
 
     void paint (juce::Graphics&) override;
+    void paintOverChildren (juce::Graphics&) override;
     void resized() override;
     void mouseMove (const juce::MouseEvent&) override;
     void mouseExit (const juce::MouseEvent&) override;
@@ -28,6 +29,10 @@ public:
 
 private:
     class Chip;
+    class Grid;
+    friend class Grid;
+    void paintGrid (juce::Graphics&);
+    void viewChanged();
 
     void rebuildChips();
     void rebuildWeights();
@@ -42,6 +47,7 @@ private:
     Analyzer& analyzer;
     juce::SharedResourcePointer<GlobalSettings> settings;
 
+    std::unique_ptr<Grid> grid;
     juce::OwnedArray<Chip> chips;
     juce::TextButton resetViewButton { "Reset View" };
     juce::Rectangle<int> chipRow, plot, freqLabels, dbLabels;
@@ -53,7 +59,8 @@ private:
     int numBands = 0;
     std::array<float, Analyzer::maxBands> freqs {};
     std::array<float, Analyzer::maxBands> weights {};      // linear power gain
-    std::array<std::array<float, Analyzer::maxBands>, Analyzer::maxChannels> curDb {}, holdDb {};
+    std::array<std::array<float, Analyzer::maxBands>, Analyzer::maxChannels> curDb {}, holdDb {}, disp {};
+    std::array<float, Analyzer::maxBands> sumDisp {};
     std::array<float, Analyzer::maxBands> sumDb {}, sumHoldDb {};
 
     bool frozen = false;
@@ -66,6 +73,8 @@ private:
     float dragDbTop = 0, dragDbBottom = 0, dragFLo = 0, dragFHi = 0;
 
     std::atomic<float>* showParam = nullptr;
+    std::atomic<float>* detectParam = nullptr;
+    std::atomic<float>* responseParam = nullptr;
     std::atomic<float>* holdParam = nullptr;
     std::atomic<float>* fallParam = nullptr;
     std::atomic<float>* weightParam = nullptr;

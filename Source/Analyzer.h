@@ -2,16 +2,20 @@
 
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_core/juce_core.h>
+#include <juce_dsp/juce_dsp.h>
 #include <array>
 #include <atomic>
+#include <memory>
 #include <vector>
 
 // Analysis engine.
 // The audio thread only copies samples into a lock-free FIFO (push()).
 // A background thread drains it and runs:
-//   - a PAZ-style constant-Q filter bank (multirate, so low bands are cheap)
+//   - a PAZ-style band analysis: multi-resolution FFTs (Blackman-Harris), bins summed per band.
+//     Below 250 Hz the bands have constant width (LF Res), above they are 1/7 octave (Q ~ 10).
+//     Each band uses the shortest FFT that still separates it sharply from its neighbours.
 //   - per-channel K-System meters (AES17 RMS, 600 ms window, 4x true peak)
-// Results are published through atomics that the editor reads at frame rate.
+// Results are published through atomics; the editor applies the ballistics at frame rate.
 class Analyzer : private juce::Thread
 {
 public:
@@ -27,20 +31,16 @@ public:
     // Audio thread: never blocks, never allocates.
     void push (const juce::AudioBuffer<float>& buffer) noexcept;
 
-    // ---- settings (written by the processor / editor) ----
-    std::atomic<int>   detectRms  { 0 };      // 0 = Peak, 1 = RMS
-    std::atomic<float> responseMs { 160.0f };
-    std::atomic<int>   lfResHz    { 20 };
-    std::atomic<bool>  spectrumActive { false }; // true while the editor is open
+    // ---- settings ----
+    std::atomic<int>  lfResHz { 20 };
+    std::atomic<bool> spectrumActive { false }; // true while the editor is open
 
     // ---- spectrum output ----
-    int  getNumBands() const noexcept            { return numBandsPublished.load(); }
     int  getLayoutVersion() const noexcept       { return layoutVersion.load(); }
-    // copies the band centre frequencies, returns the band count
     int  copyBandFrequencies (std::array<float, maxBands>& dest) const;
-    // current smoothed power (linear, 1.0 = full-scale sine peak)
+    // latest band mean-square power (a sine of amplitude A reads A^2 / 2)
     float getBandPower (int ch, int band) const noexcept { return bandPow[(size_t) (ch * maxBands + band)].load (std::memory_order_relaxed); }
-    // highest power since the last call (resets it)
+    // highest band power since the last call (resets it)
     float takeBandMax (int ch, int band) noexcept        { return bandMax[(size_t) (ch * maxBands + band)].exchange (0.0f, std::memory_order_relaxed); }
 
     // ---- meter output (dBFS) ----
@@ -55,7 +55,8 @@ public:
 private:
     void run() override;
     void processChunk (int start, int numSamples);
-    void rebuildFilterBank();
+    void runSpectrum();
+    void rebuildBands();
     void rebuildMeters();
 
     // ---------- FIFO ----------
@@ -67,45 +68,34 @@ private:
     std::atomic<int> numChannels { 2 };
     std::atomic<bool> needsRebuild { true };
 
-    // ---------- filter bank ----------
-    struct Biquad
+    // ---------- spectrum ----------
+    static constexpr int maxOrder = 16;                 // 65536-point FFT at most
+    static constexpr int historySize = 1 << maxOrder;
+    juce::AudioBuffer<float> history { maxChannels, historySize * 2 }; // written twice -> contiguous reads
+    int historyPos = 0;
+    juce::int64 totalSamples = 0;
+    std::array<juce::int64, maxChannels> lastSound {};  // sample index after the last non-silent sample
+
+    struct Resolution
     {
-        float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
-        inline float process (float x, float& s1, float& s2) const noexcept
-        {
-            const float y = b0 * x + s1;
-            s1 = b1 * x - a1 * y + s2;
-            s2 = b2 * x - a2 * y;
-            return y;
-        }
+        int order = 10, size = 1024, hop = 256;
+        std::unique_ptr<juce::dsp::FFT> fft;
+        std::vector<float> window, buffer;
+        float norm = 1.0f;          // converts summed |X|^2 to mean-square power
+        juce::int64 lastRun = 0;
+        std::vector<int> bands;
     };
 
     struct Band
     {
         float freq = 1000.0f;
-        int level = 0;
-        Biquad bp;
-        std::array<std::array<float, 4>, maxChannels> state {};
-        std::array<float, maxChannels> env {};
-        std::array<float, maxChannels> mx {};
-        float coeff = 0.0f; // envelope coefficient at this band's sample rate
+        int resolution = 0;
+        int binLo = 0, binHi = 0;
     };
 
-    struct Level
-    {
-        double rate = 48000.0;
-        std::array<Biquad, 3> lp;                                  // decimation filter (input side)
-        std::array<std::array<float, 6>, maxChannels> lpState {};
-        std::array<int, maxChannels> phase {};
-        std::vector<int> bands;
-    };
-
+    std::vector<Resolution> resolutions;
     std::vector<Band> bands;
-    std::vector<Level> levels;
     int builtLfRes = -1;
-    float builtResponse = -1.0f;
-    int builtDetect = -1;
-    void updateEnvelopeCoeffs();
 
     std::array<std::atomic<float>, maxChannels * maxBands> bandPow {};
     std::array<std::atomic<float>, maxChannels * maxBands> bandMax {};
@@ -118,7 +108,6 @@ private:
     struct MeterState
     {
         std::array<float, 12> tpHistory {};
-        int tpPos = 0;
         double subSum = 0.0;
         int subCount = 0;
         std::vector<double> ring;
